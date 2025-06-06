@@ -2,63 +2,130 @@ import requests
 import json
 import csv
 import re
+import time
+from pathlib import Path
 from argparse import ArgumentParser
 from tqdm import tqdm
+from collections import defaultdict, Counter
 
 URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
-def judge_synonym(prompt, col, ans, iam_token, folder_id, model_name):
+class SynonymEvaluator:
+    def __init__(self, iam_token, folder_id, model_name='yandexgpt-lite/latest'):
+        self.iam_token = iam_token
+        self.folder_id = folder_id
+        self.model_name = model_name
+        self.stats = defaultdict(int)
+        self.evaluation_scores = []
+        self.error_count = 0
+        self.start_time = None
+        
+    def judge_synonym(self, prompt, col, ans):
+        """Оценка синонимичности"""
+        
+        data = {
+            "modelUri": f"gpt://{self.folder_id}/{self.model_name}",
+            "completionOptions": {"temperature": 1, "maxTokens": 100},
+            "messages": [{"role": "user", "text": prompt}]
+        }
+        
+        try:
+            response = requests.post(
+                URL,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {self.iam_token}"
+                },
+                json=data,
+                timeout=30
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            text = result["result"]["alternatives"][0]["message"]["text"]
+            return text
+                
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON: {e}, collocation: {col}, model's answer: {ans}")
+            print(f"Response content: {response.text if 'response' in locals() else 'Response unavailable'}")
+            return "Error"
+        except Exception:
+            return "Error"
 
-    data = {}
-    data["modelUri"] = "gpt://"+ folder_id + '/' + model_name
-    data["completionOptions"] = {"temperature": 1, "maxTokens": 100}
-    messages = [
-            {"role": "user", "text": prompt}
-            ]
-    data['messages'] = messages
-    response = requests.post(
-        URL,
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {iam_token}"
-        },
-        json=data,
-    ).text
+    def parse_evaluation_result(self, result_text):
+        """Парсинг JSON результата оценки"""
+        json_match = re.search(r'\{.*?\}', result_text, re.DOTALL)
+        if json_match:
+            json_string = json_match.group(0)
+            try:
+                json_data = json.loads(json_string)
+                # Валидация структуры JSON
+                required_keys = ["Семантическая близость", "Грамматическая близость", "Сумма"]
+                if all(key in json_data for key in required_keys):
+                    # Конвертация в числа
+                    for key in required_keys:
+                        json_data[key] = float(json_data[key])
+                    
+                    self.evaluation_scores.append(json_data["Сумма"])
+                    return json.dumps(json_data, ensure_ascii=False, indent=2)
+            except json.JSONDecodeError:
+                pass
+                
+        return '-'
 
-    try:
-      text = json.loads(response)["result"]["alternatives"][0]["message"]["text"]
-    except json.JSONDecodeError as e:
-        print(f"Error decoding JSON: {e}, collocation: {col}, model's answer: {ans}")
-        print(f"Response content: {response}")
-        text = "Error"
-    return text
+    def write_to_csv(self, file_path, row):
+        """Запись строки в CSV файл"""
+        with open(file_path, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(row)
+            csvfile.flush()
 
-def write_to_csv(file_path, row):
-  with open(file_path, 'a', newline='', encoding='utf-8') as csvfile:
-    writer = csv.writer(csvfile)
-    writer.writerow(row)
-    csvfile.flush()
+    def run_evaluation(self, prompt, cols, answers, true_syns, output_file):
+        """Основной цикл оценки"""
+        self.start_time = time.time()
+        judge_results = []
+        
+        for col, ans, true_syn in tqdm(zip(cols, answers, true_syns), total=len(cols), desc="Judging answers"):
+            formatted_prompt = prompt.format(ans=ans, true_syn=true_syn)
+            result = self.judge_synonym(formatted_prompt, col, ans)
+            json_res = self.parse_evaluation_result(result)
+            
+            row = [col, ans, true_syn, json_res]
+            self.write_to_csv(output_file, row)
+            judge_results.append(json_res)
+        
+        self._print_final_stats(len(cols))
+        return judge_results
 
-def run_judge_with_csv(prompt, cols, answers, true_syns, file_path, iam_token, folder_id, model_name):
-  
-  judge_results = []
+def load_input_data(file_path):
+    """Загрузка входных данных"""
+    cols, answers, true_syns = [], [], []
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+                
+            parts = line.split('@')
+            if len(parts) != 3:
+                continue
+                
+            cols.append(parts[0])
+            answers.append(parts[1])
+            true_syns.append(parts[2])
+    
+    return cols, answers, true_syns
 
-  for col, ans, true_syn in tqdm(zip(cols, answers, true_syns), total=len(cols), desc="Judging answers"):
-    formatted_prompt = prompt.format(ans=ans, true_syn=true_syn)
-    result = judge_synonym(formatted_prompt, col, ans, iam_token, folder_id, model_name)
-    json_match = re.search(r'\{.*?\}', result, re.DOTALL)
-    if json_match:
-      json_string = json_match.group(0)
-      json_data = json.loads(json_string)
-      json_res = json.dumps(json_data, ensure_ascii=False, indent=2)
-    else:
-      json_res = '-'
-    row = [col, ans, true_syn, json_res]
-    write_to_csv(file_path, row)
-    judge_results.append(json_res)
+def initialize_output_file(output_path):
+    """Инициализация выходного CSV файла"""
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['collocation', 'model_answer', 'true_synonym', 'evaluation'])
 
-  return judge_results
-
+# Промпт для оценки (сохранен без изменений)
 prompt_llm_as_judge_paraphrase = """
     Ты - лингвистический эксперт, оценивающий семантическую и грамматическую близость двух глаголов.
 
@@ -89,40 +156,67 @@ prompt_llm_as_judge_paraphrase = """
     Твой ответ должен содержать только json объект, больше ничего. НЕ приводи в ответе НИКАКИЕ рассуждения.
     """
 
-argument_parser = ArgumentParser()
-argument_parser.add_argument("--model_answers_zero_shot")
-argument_parser.add_argument("--model_answers_one_shot")
-argument_parser.add_argument("--model_answers_few_shot")
-argument_parser.add_argument("--vars")
-argument_parser.add_argument("--output_csv_eval_zero_shot")
-argument_parser.add_argument("--output_csv_eval_one_shot")
-argument_parser.add_argument("--output_csv_eval_few_shot")
+def main():
+    argument_parser = ArgumentParser(description="Оценка синонимичности глаголов с помощью LLM")
+    argument_parser.add_argument("--model_answers_zero_shot", required=True, 
+                               help="Путь к файлу с ответами модели (zero-shot)")
+    argument_parser.add_argument("--model_answers_one_shot", 
+                               help="Путь к файлу с ответами модели (one-shot)")
+    argument_parser.add_argument("--model_answers_few_shot", 
+                               help="Путь к файлу с ответами модели (few-shot)")
+    argument_parser.add_argument("--vars", required=True, 
+                               help="Путь к файлу с конфигурацией (folder_id, iamToken)")
+    argument_parser.add_argument("--output_csv_eval_zero_shot", required=True,
+                               help="Путь к выходному CSV файлу (zero-shot)")
+    argument_parser.add_argument("--output_csv_eval_one_shot", 
+                               help="Путь к выходному CSV файлу (one-shot)")
+    argument_parser.add_argument("--output_csv_eval_few_shot", 
+                               help="Путь к выходному CSV файлу (few-shot)")
+    
+    args = argument_parser.parse_args()
+    
+    # Загрузка конфигурации
+    with open(args.vars, "r", encoding="utf-8") as fin:
+        config = json.load(fin)
+        folder_id = config["folder_id"]
+        iam_token = config["iamToken"]
+    
+    model_name = 'yandexgpt-lite/latest'
+    
+    # Подготовка списков входных и выходных файлов
+    input_files = []
+    output_files = []
+    
+    if args.model_answers_zero_shot and args.output_csv_eval_zero_shot:
+        input_files.append(args.model_answers_zero_shot)
+        output_files.append(args.output_csv_eval_zero_shot)
+        
+    if args.model_answers_one_shot and args.output_csv_eval_one_shot:
+        input_files.append(args.model_answers_one_shot)
+        output_files.append(args.output_csv_eval_one_shot)
+        
+    if args.model_answers_few_shot and args.output_csv_eval_few_shot:
+        input_files.append(args.model_answers_few_shot)
+        output_files.append(args.output_csv_eval_few_shot)
+    
+    # Инициализация выходных файлов
+    for output_file in output_files:
+        initialize_output_file(output_file)
+    
+    # Обработка каждой пары файлов
+    for input_file, output_file in zip(input_files, output_files):
+        # Создание экземпляра оценщика для каждого файла
+        evaluator = SynonymEvaluator(iam_token, folder_id, model_name)
+        
+        # Загрузка данных
+        cols, answers, true_syns = load_input_data(input_file)
+        
+        # Запуск оценки
+        judge_results = evaluator.run_evaluation(
+            prompt_llm_as_judge_paraphrase, 
+            cols, answers, true_syns, 
+            output_file
+        )
 
 if __name__ == "__main__":
-    args = argument_parser.parse_args()
-
-    with open(args.vars, "r", encoding="utf-8") as fin:
-      folder_id = json.load(fin)["folder_id"]
-    with open(args.vars, "r", encoding="utf-8") as fin:
-      iam_token = json.load(fin)["iamToken"]
-
-    model_name = 'yandexgpt-lite/latest'
-    input_dirs = [args.model_answers_zero_shot, args.model_answers_one_shot, args.model_answers_few_shot]
-    output_dirs = [args.output_csv_eval_zero_shot, args.output_csv_eval_one_shot, args.output_csv_eval_few_shot]
-
-    for dir in output_dirs:
-        with open(dir, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(['collocation', 'model_answer', 'true_synonym', 'evaluation'])
-
-    for input_dir, output_dir in zip(tqdm(input_dirs, desc="Processing input/output pairs"), output_dirs):
-        cols, answers, true_syns = [], [], []
-    
-        with open(input_dir, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip().split('@')
-                cols.append(line[0])
-                answers.append(line[1])
-                true_syns.append(line[2])
-    
-        judge_results = run_judge_with_csv(prompt_llm_as_judge_paraphrase, cols, answers, true_syns, output_dir, iam_token, folder_id, model_name)
+    main()

@@ -59,10 +59,13 @@ The fine-tuned YandexGPT5-Lite 8B model is available on Hugging Face:
 ---
 
 ## Repository Structure
+
+```text
 russian-verb-noun-collocations/
 ├── data/verb-noun-collocations-dataset.csv
-├── _runners/ # Scripts for model evaluation
-├── llm-as-a-judge # Scripts for model evaluation on paraphrasing and gap filling
-├── LoRA/ # LoRA training script and configs
+├── _runners/                  # Scripts for model evaluation
+├── llm-as-a-judge/            # Scripts for model evaluation on paraphrasing and gap filling
+├── LoRA/                      # LoRA training script and configs
 └── README.md
+
 
